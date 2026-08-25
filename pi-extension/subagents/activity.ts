@@ -292,10 +292,12 @@ export function createSubagentActivityRecorder(params: {
   activityFile?: string;
   now?: () => number;
 }): SubagentActivityRecorder {
-  const runningChildId = params.runningChildId?.trim();
-  const activityFile = params.activityFile?.trim();
-  if (!runningChildId || !activityFile) return createNoopRecorder();
+  const requestedRunningChildId = params.runningChildId?.trim();
+  const requestedActivityFile = params.activityFile?.trim();
+  if (!requestedRunningChildId || !requestedActivityFile) return createNoopRecorder();
 
+  const runningChildId: string = requestedRunningChildId;
+  const activityFile: string = requestedActivityFile;
   const now = params.now ?? (() => Date.now());
   const createdAt = now();
   const activity: SubagentActivityState = {
