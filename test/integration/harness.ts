@@ -18,6 +18,7 @@ import {
   existsSync,
   readFileSync,
   unlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -76,6 +77,7 @@ export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "anthropic/claude-haiku-4
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
+export const TEST_PANE_MANIFEST = join(tmpdir(), "pi-interactive-subagents-herdr-test-panes.json");
 
 // ── Backend detection ──
 
@@ -131,6 +133,49 @@ export interface TestEnv {
   tempFiles: string[];
 }
 
+const activeTestEnvironments = new Set<TestEnv>();
+
+function readTestPaneManifest(): string[] {
+  try {
+    const value: unknown = JSON.parse(readFileSync(TEST_PANE_MANIFEST, "utf8"));
+    return Array.isArray(value)
+      ? value.filter((paneId): paneId is string => typeof paneId === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeTestPaneManifest(paneIds: string[]): void {
+  writeFileSync(TEST_PANE_MANIFEST, `${JSON.stringify([...new Set(paneIds)], null, 2)}\n`);
+}
+
+export function registerTestSurface(surface: string): void {
+  writeTestPaneManifest([...readTestPaneManifest(), surface]);
+}
+
+export function unregisterTestSurface(surface: string): void {
+  writeTestPaneManifest(readTestPaneManifest().filter((paneId) => paneId !== surface));
+}
+
+export function cleanupStaleTestSurfaces(): string[] {
+  const herdrBin: string = process.env.HERDR_BIN_PATH ?? "herdr";
+  const remainingSurfaces: string[] = [];
+
+  for (const surface of readTestPaneManifest()) {
+    try {
+      execFileSync(herdrBin, ["pane", "close", surface], { stdio: "ignore" });
+    } catch {
+      try {
+        execFileSync(herdrBin, ["pane", "get", surface], { stdio: "ignore" });
+        remainingSurfaces.push(surface);
+      } catch {}
+    }
+  }
+  writeTestPaneManifest(remainingSurfaces);
+  return remainingSurfaces;
+}
+
 /**
  * Create an isolated test environment with test agent definitions.
  * The temp dir has `.pi/agents/` containing copies of all test agents.
@@ -149,17 +194,21 @@ export function createTestEnv(): TestEnv {
     }
   }
 
-  return { dir, surfaces: [], tempFiles: [] };
+  const env: TestEnv = { dir, surfaces: [], tempFiles: [] };
+  activeTestEnvironments.add(env);
+  return env;
 }
 
 /**
  * Clean up all resources created during the test.
  */
 export function cleanupTestEnv(env: TestEnv): void {
+  activeTestEnvironments.delete(env);
   for (const surface of env.surfaces) {
     try {
       closeSurface(surface);
     } catch {}
+    unregisterTestSurface(surface);
   }
   for (const file of env.tempFiles) {
     try {
@@ -171,12 +220,28 @@ export function cleanupTestEnv(env: TestEnv): void {
   } catch {}
 }
 
+function cleanupActiveTestEnvironments(): void {
+  for (const env of [...activeTestEnvironments]) cleanupTestEnv(env);
+}
+
+function terminateAfterCleanup(signal: NodeJS.Signals): void {
+  cleanupActiveTestEnvironments();
+  cleanupStaleTestSurfaces();
+  process.removeAllListeners(signal);
+  process.kill(process.pid, signal);
+}
+
+process.once("exit", cleanupActiveTestEnvironments);
+process.once("SIGINT", () => terminateAfterCleanup("SIGINT"));
+process.once("SIGTERM", () => terminateAfterCleanup("SIGTERM"));
+
 /**
  * Create a surface and register it for automatic cleanup.
  */
 export function createTrackedSurface(env: TestEnv, name: string): string {
   const surface = createSurface(name);
   env.surfaces.push(surface);
+  registerTestSurface(surface);
   return surface;
 }
 
@@ -188,6 +253,7 @@ export function createTrackedSurfaceSplit(
 ): string {
   const surface = createSurfaceSplit(name, direction, fromSurface);
   env.surfaces.push(surface);
+  registerTestSurface(surface);
   return surface;
 }
 
@@ -196,6 +262,7 @@ export function createTrackedSurfaceSplit(
  */
 export function untrackSurface(env: TestEnv, surface: string): void {
   env.surfaces = env.surfaces.filter((s) => s !== surface);
+  unregisterTestSurface(surface);
 }
 
 // ── Pi session management ──

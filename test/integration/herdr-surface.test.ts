@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import { after, before, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import {
   cleanupTestEnv,
   closeSurface,
@@ -26,22 +26,34 @@ import {
   type TestEnv,
 } from "./harness.ts";
 
-const backends: string[] = getAvailableBackends();
+const backends: string[] = process.env.PI_RUN_HERDR_INTEGRATION === "1"
+  ? getAvailableBackends()
+  : [];
 const HERDR_BIN: string = process.env.HERDR_BIN_PATH ?? "herdr";
 
+interface HerdrLayout {
+  panes: Array<{
+    focused?: boolean;
+    pane_id: string;
+    rect: { height: number; width: number; x: number; y: number };
+  }>;
+  tab_id: string;
+  zoomed: boolean;
+}
+
 if (backends.length === 0) {
-  console.log("Herdr is not available — skipping Herdr surface integration tests");
+  console.log("Herdr surface tests are disabled — set PI_RUN_HERDR_INTEGRATION=1 inside Herdr");
 }
 
 for (const backend of backends) {
   describe(`Herdr surface [${backend}]`, { timeout: 60_000 }, () => {
     let env: TestEnv;
 
-    before(() => {
+    beforeEach(() => {
       env = createTestEnv();
     });
 
-    after(() => {
+    afterEach(() => {
       cleanupTestEnv(env);
     });
 
@@ -52,6 +64,98 @@ for (const backend of backends) {
       await sleep(100);
       assert.equal(getFocusedSurface(), focusedBefore);
       assert.equal(getPaneFocus(surface), false);
+    });
+
+    it("keeps the parent width stable while balancing the right column", () => {
+      const parentSurface: string = getCurrentPaneId();
+      const firstSurface: string = createTrackedSurface(env, "column-1");
+      const firstLayout: HerdrLayout = getPaneLayout(parentSurface);
+      const parentWidthAfterFirst: number = getPaneRect(firstLayout, parentSurface).width;
+      const childSurfaces: string[] = [
+        firstSurface,
+        createTrackedSurface(env, "column-2"),
+        createTrackedSurface(env, "column-3"),
+        createTrackedSurface(env, "column-4"),
+      ];
+      const finalLayout: HerdrLayout = getPaneLayout(parentSurface);
+      const childRects = childSurfaces.map((surface) => getPaneRect(finalLayout, surface));
+      const childHeights: number[] = childRects.map((rect) => rect.height);
+
+      assert.equal(getPaneRect(finalLayout, parentSurface).width, parentWidthAfterFirst);
+      assert.equal(new Set(childRects.map((rect) => rect.x)).size, 1);
+      assert.equal(new Set(childRects.map((rect) => rect.width)).size, 1);
+      assert.ok(Math.max(...childHeights) - Math.min(...childHeights) <= 1);
+      assert.ok(childSurfaces.every((surface) => getPaneFocus(surface) === false));
+    });
+
+    it("uses a down split for a nested subagent", async () => {
+      const originalSubagentId: string | undefined = process.env.PI_SUBAGENT_ID;
+      const parentSurface: string = getCurrentPaneId();
+      const parentRectBefore = getPaneRect(getPaneLayout(parentSurface), parentSurface);
+      let nestedSurface: string | null = null;
+
+      process.env.PI_SUBAGENT_ID = "nested-layout-test";
+      try {
+        const herdr = await import(`../../pi-extension/subagents/herdr.ts?nested=${Date.now()}`);
+        nestedSurface = herdr.createSurface("nested-child");
+        assert.ok(nestedSurface);
+        const layoutAfter: HerdrLayout = getPaneLayout(parentSurface);
+        const parentRectAfter = getPaneRect(layoutAfter, parentSurface);
+        const childRect = getPaneRect(layoutAfter, nestedSurface);
+
+        assert.equal(parentRectAfter.width, parentRectBefore.width);
+        assert.equal(childRect.width, parentRectBefore.width);
+        assert.ok(parentRectAfter.height < parentRectBefore.height);
+        assert.ok(childRect.height < parentRectBefore.height);
+        herdr.closeSurface(nestedSurface);
+        nestedSurface = null;
+      } finally {
+        if (nestedSurface) execFileSync(HERDR_BIN, ["pane", "close", nestedSurface]);
+        restoreEnvVar("PI_SUBAGENT_ID", originalSubagentId);
+      }
+    });
+
+    it("preserves output through zoom and unzoom", async () => {
+      const firstSurface: string = createTrackedSurface(env, "zoom-1");
+      const secondSurface: string = createTrackedSurface(env, "zoom-2");
+      const firstMarker: string = `ZOOM_FIRST_${uniqueId()}`;
+      const secondMarker: string = `ZOOM_SECOND_${uniqueId()}`;
+
+      sendCommand(firstSurface, `printf '%s\\n' ${shellEscape(firstMarker)}`);
+      sendCommand(secondSurface, `printf '%s\\n' ${shellEscape(secondMarker)}`);
+      await Promise.all([
+        waitForScreen(firstSurface, new RegExp(firstMarker), 10_000, 50),
+        waitForScreen(secondSurface, new RegExp(secondMarker), 10_000, 50),
+      ]);
+
+      execFileSync(HERDR_BIN, ["pane", "zoom", "--pane", secondSurface, "--on"]);
+      assert.equal(getPaneLayout(secondSurface).zoomed, true);
+      assert.match(readScreen(firstSurface, 50), new RegExp(firstMarker));
+      assert.match(readScreen(secondSurface, 50), new RegExp(secondMarker));
+
+      execFileSync(HERDR_BIN, ["pane", "zoom", "--pane", secondSurface, "--off"]);
+      assert.equal(getPaneLayout(secondSurface).zoomed, false);
+      assert.match(readScreen(firstSurface, 50), new RegExp(firstMarker));
+      assert.match(readScreen(secondSurface, 50), new RegExp(secondMarker));
+    });
+
+    it("closes children in any order without closing the parent", () => {
+      const parentSurface: string = getCurrentPaneId();
+      const surfaces: string[] = [
+        createTrackedSurface(env, "close-1"),
+        createTrackedSurface(env, "close-2"),
+        createTrackedSurface(env, "close-3"),
+        createTrackedSurface(env, "close-4"),
+      ];
+      const closeOrder: string[] = [surfaces[1], surfaces[0], surfaces[3], surfaces[2]];
+
+      for (const surface of closeOrder) {
+        closeSurface(surface);
+        untrackSurface(env, surface);
+      }
+
+      assert.equal(getPaneLayout(parentSurface).panes.some((pane) => pane.pane_id === parentSurface), true);
+      assert.throws(() => closeSurface(parentSurface), /Refusing to close pane/);
     });
 
     it("sends a command, reads output, and closes the child", async () => {
@@ -220,11 +324,51 @@ for (const backend of backends) {
   });
 }
 
+function getCurrentPaneId(): string {
+  const output: string = execFileSync(HERDR_BIN, ["pane", "current"], { encoding: "utf8" });
+  const response = JSON.parse(output) as { result?: { pane?: { pane_id?: string } } };
+  const paneId: string | undefined = response.result?.pane?.pane_id;
+
+  if (!paneId) throw new Error(`Herdr returned no current pane: ${output}`);
+  return paneId;
+}
+
+function getPaneLayout(surface: string): HerdrLayout {
+  const output: string = execFileSync(
+    HERDR_BIN,
+    ["pane", "layout", "--pane", surface],
+    { encoding: "utf8" },
+  );
+  const response = JSON.parse(output) as { result?: { layout?: HerdrLayout } };
+  const layout: HerdrLayout | undefined = response.result?.layout;
+
+  if (!layout) throw new Error(`Herdr returned no layout for pane ${surface}: ${output}`);
+  return layout;
+}
+
+function getPaneRect(
+  layout: HerdrLayout,
+  surface: string,
+): { height: number; width: number; x: number; y: number } {
+  const rect = layout.panes.find((pane) => pane.pane_id === surface)?.rect;
+
+  if (!rect) throw new Error(`Pane ${surface} is absent from layout ${layout.tab_id}`);
+  return rect;
+}
+
 function getPaneFocus(surface: string): boolean | undefined {
   const output: string = execFileSync(HERDR_BIN, ["pane", "get", surface], { encoding: "utf8" });
   const response = JSON.parse(output) as { result?: { pane?: { focused?: boolean } } };
 
   return response.result?.pane?.focused;
+}
+
+function restoreEnvVar(name: string, originalValue: string | undefined): void {
+  if (originalValue === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = originalValue;
+  }
 }
 
 function restoreHerdrBinPath(originalBinPath: string | undefined): void {

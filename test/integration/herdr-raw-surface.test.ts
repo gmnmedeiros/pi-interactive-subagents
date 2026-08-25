@@ -4,10 +4,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { registerTestSurface, unregisterTestSurface } from "./harness.ts";
 
 const HERDR_BIN = process.env.HERDR_BIN_PATH ?? "herdr";
 const RAW_SURFACE_TIMEOUT_MS = Number(process.env.PI_HERDR_RAW_TIMEOUT_MS ?? "10000");
-const IS_HERDR_AVAILABLE = isHerdrAvailable();
+const IS_HERDR_AVAILABLE =
+  process.env.PI_RUN_HERDR_INTEGRATION === "1" && isHerdrAvailable();
 
 interface HerdrPane {
   focused?: boolean;
@@ -80,7 +82,7 @@ async function waitForPaneOutput(paneId: string, marker: string): Promise<string
 }
 
 if (!IS_HERDR_AVAILABLE) {
-  console.log("Herdr is not available — skipping raw Herdr surface integration tests");
+  console.log("Raw Herdr tests are disabled — set PI_RUN_HERDR_INTEGRATION=1 inside Herdr");
 }
 
 if (IS_HERDR_AVAILABLE) {
@@ -124,6 +126,7 @@ if (IS_HERDR_AVAILABLE) {
           ]),
         );
         paneId = createdPane.pane_id;
+        registerTestSurface(paneId);
 
         const paneAfterCreation: HerdrPane = parsePane(runHerdr(["pane", "get", paneId]));
         assert.equal(paneAfterCreation.focused, false, "new pane must not take focus");
@@ -138,6 +141,7 @@ if (IS_HERDR_AVAILABLE) {
           try {
             runHerdr(["pane", "close", paneId]);
           } catch {}
+          unregisterTestSurface(paneId);
         }
         rmSync(testDir, { recursive: true, force: true });
       }

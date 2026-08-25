@@ -17,7 +17,7 @@ import { homedir } from "node:os";
 import {
   isMuxAvailable,
   muxSetupHint,
-  createSurface,
+  createReadySurface,
   sendCommand,
   sendLongCommand,
   waitForStart,
@@ -1248,7 +1248,7 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  const surface = options?.surface ?? createSurface(name);
+  const surface = options?.surface ?? await createReadySurface(name);
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
@@ -2184,7 +2184,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
-        const surface = createSurface(name);
+        const surface = await createReadySurface(name);
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(sessionPath)];

@@ -8,7 +8,16 @@ const execFileAsync = promisify(execFile);
 const HERDR_BIN = process.env.HERDR_BIN_PATH?.trim() || "herdr";
 const DEFAULT_START_TIMEOUT_MS = 10_000;
 const DEFAULT_START_INTERVAL_MS = 50;
+const DEFAULT_SURFACE_READY_TIMEOUT_MS = readPositiveInteger(
+  "PI_SUBAGENT_SURFACE_READY_TIMEOUT_MS",
+  3_000,
+);
+const MAX_SURFACE_READY_ATTEMPTS = readPositiveInteger(
+  "PI_SUBAGENT_SURFACE_READY_ATTEMPTS",
+  2,
+);
 const createdSurfaces = new Set<string>();
+let callerSurface: string | null = null;
 let isHerdrCommandAvailable: boolean | null = null;
 
 interface HerdrPaneResponse {
@@ -18,6 +27,33 @@ interface HerdrPaneResponse {
     };
   };
 }
+
+function readPositiveInteger(name: string, fallback: number): number {
+  const rawValue: string | undefined = process.env[name]?.trim();
+  const value: number = rawValue ? Number(rawValue) : Number.NaN;
+
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+interface SurfaceLeaf {
+  kind: "leaf";
+  surface: string;
+}
+
+interface SurfaceSplit {
+  first: SurfaceLayout;
+  kind: "split";
+  second: SurfaceLayout;
+}
+
+type SurfaceLayout = SurfaceLeaf | SurfaceSplit;
+
+interface SurfaceDepth {
+  depth: number;
+  surface: string;
+}
+
+let automaticSurfaceLayout: SurfaceLayout | null = null;
 
 export interface PollResult {
   reason: "done" | "error" | "process-exit" | "sentinel";
@@ -58,19 +94,41 @@ function runHerdr(args: string[]): string {
   return execFileSync(HERDR_BIN, args, { encoding: "utf8" });
 }
 
-function parsePaneId(output: string): string {
+function parsePaneId(output: string, operation: string): string {
   let response: HerdrPaneResponse;
   let paneId: string | undefined;
 
   try {
     response = JSON.parse(output) as HerdrPaneResponse;
   } catch {
-    throw new Error(`Herdr returned malformed JSON while creating a pane: ${output}`);
+    throw new Error(`Herdr returned malformed JSON while ${operation}: ${output}`);
   }
 
   paneId = response.result?.pane?.pane_id;
-  if (!paneId) throw new Error(`Herdr returned no pane ID: ${output}`);
+  if (!paneId) throw new Error(`Herdr returned no pane ID while ${operation}: ${output}`);
   return paneId;
+}
+
+function resolveCallerSurface(): string {
+  const inheritedSurface: string | undefined = process.env.HERDR_PANE_ID?.trim();
+  let output: string;
+
+  if (callerSurface) return callerSurface;
+  if (inheritedSurface) {
+    callerSurface = inheritedSurface;
+    return callerSurface;
+  }
+
+  try {
+    output = runHerdr(["pane", "current", "--current"]);
+  } catch (error) {
+    throw new Error(
+      "Failed to resolve the current Herdr caller pane. Start pi inside a Herdr pane.",
+      { cause: error },
+    );
+  }
+  callerSurface = parsePaneId(output, "resolving the current caller");
+  return callerSurface;
 }
 
 function isSurfaceAvailable(surface: string): boolean {
@@ -86,8 +144,88 @@ export function shellEscape(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function listSurfaceDepths(
+  layout: SurfaceLayout,
+  depth: number,
+  surfaces: SurfaceDepth[],
+): void {
+  if (layout.kind === "leaf") {
+    surfaces.push({ depth, surface: layout.surface });
+    return;
+  }
+  listSurfaceDepths(layout.first, depth + 1, surfaces);
+  listSurfaceDepths(layout.second, depth + 1, surfaces);
+}
+
+function replaceSurfaceLeaf(
+  layout: SurfaceLayout,
+  surface: string,
+  replacement: SurfaceLayout,
+): SurfaceLayout {
+  if (layout.kind === "leaf") return layout.surface === surface ? replacement : layout;
+  return {
+    kind: "split",
+    first: replaceSurfaceLeaf(layout.first, surface, replacement),
+    second: replaceSurfaceLeaf(layout.second, surface, replacement),
+  };
+}
+
+function removeSurfaceLeaf(layout: SurfaceLayout, surface: string): SurfaceLayout | null {
+  let first: SurfaceLayout | null;
+  let second: SurfaceLayout | null;
+
+  if (layout.kind === "leaf") return layout.surface === surface ? null : layout;
+  first = removeSurfaceLeaf(layout.first, surface);
+  second = removeSurfaceLeaf(layout.second, surface);
+  if (!first) return second;
+  if (!second) return first;
+  return { kind: "split", first, second };
+}
+
+function pruneUnavailableSurfaces(): void {
+  let surfaces: SurfaceDepth[];
+
+  if (!automaticSurfaceLayout) return;
+  surfaces = [];
+  listSurfaceDepths(automaticSurfaceLayout, 0, surfaces);
+  for (const candidate of surfaces) {
+    if (!isSurfaceAvailable(candidate.surface)) {
+      automaticSurfaceLayout = removeSurfaceLeaf(automaticSurfaceLayout, candidate.surface);
+      createdSurfaces.delete(candidate.surface);
+      if (!automaticSurfaceLayout) return;
+    }
+  }
+}
+
 export function createSurface(name: string): string {
-  return createSurfaceSplit(name, "right");
+  const surfaces: SurfaceDepth[] = [];
+  let direction: "right" | "down";
+  let newSurface: string;
+  let target: SurfaceDepth;
+
+  pruneUnavailableSurfaces();
+  if (!automaticSurfaceLayout) {
+    direction = process.env.PI_SUBAGENT_ID ? "down" : "right";
+    newSurface = createSurfaceSplit(name, direction);
+    automaticSurfaceLayout = { kind: "leaf", surface: newSurface };
+    return newSurface;
+  }
+
+  listSurfaceDepths(automaticSurfaceLayout, 0, surfaces);
+  target = surfaces.reduce((best, candidate) =>
+    candidate.depth < best.depth ? candidate : best,
+  );
+  newSurface = createSurfaceSplit(name, "down", target.surface);
+  automaticSurfaceLayout = replaceSurfaceLeaf(
+    automaticSurfaceLayout,
+    target.surface,
+    {
+      kind: "split",
+      first: { kind: "leaf", surface: target.surface },
+      second: { kind: "leaf", surface: newSurface },
+    },
+  );
+  return newSurface;
 }
 
 export function createSurfaceSplit(
@@ -105,11 +243,7 @@ export function createSurfaceSplit(
     throw new Error(`Herdr only supports right and down pane splits, not ${direction}`);
   }
 
-  if (fromSurface) {
-    args.push("--pane", fromSurface);
-  } else {
-    args.push("--current");
-  }
+  args.push("--pane", fromSurface ?? resolveCallerSurface());
   args.push(
     "--direction",
     direction,
@@ -129,13 +263,46 @@ export function createSurfaceSplit(
     );
   }
 
-  paneId = parsePaneId(output);
+  paneId = parsePaneId(output, "creating a pane");
   createdSurfaces.add(paneId);
   return paneId;
 }
 
 export function sendCommand(surface: string, command: string): void {
   runHerdr(["pane", "run", surface, command]);
+}
+
+export async function createReadySurface(name: string): Promise<string> {
+  const readyDir: string = join(tmpdir(), "pi-subagent-surface-ready");
+  let lastError: unknown = null;
+
+  mkdirSync(readyDir, { recursive: true });
+  for (let attempt = 1; attempt <= MAX_SURFACE_READY_ATTEMPTS; attempt += 1) {
+    const surface: string = createSurface(name);
+    const token: string = `${process.pid}-${Date.now()}-${attempt}-${Math.random().toString(16).slice(2)}`;
+    const readyFile: string = join(readyDir, `${token}.ready`);
+
+    try {
+      sendCommand(surface, `printf '%s\\n' ${shellEscape(token)} > ${shellEscape(readyFile)}`);
+      await waitForStart(readyFile, { timeout: DEFAULT_SURFACE_READY_TIMEOUT_MS });
+      if (readFileSync(readyFile, "utf8").trim() !== token) {
+        throw new Error(`Herdr pane ${surface} wrote an invalid shell-readiness token`);
+      }
+      rmSync(readyFile, { force: true });
+      return surface;
+    } catch (error) {
+      lastError = error;
+      try {
+        closeSurface(surface);
+      } catch {}
+      rmSync(readyFile, { force: true });
+    }
+  }
+
+  throw new Error(
+    `Herdr did not provide a command-ready shell after ${MAX_SURFACE_READY_ATTEMPTS} attempts`,
+    { cause: lastError },
+  );
 }
 
 export function sendLongCommand(
@@ -215,6 +382,9 @@ export function closeSurface(surface: string): void {
   }
   if (!isSurfaceAvailable(surface)) {
     createdSurfaces.delete(surface);
+    if (automaticSurfaceLayout) {
+      automaticSurfaceLayout = removeSurfaceLeaf(automaticSurfaceLayout, surface);
+    }
     return;
   }
 
@@ -224,6 +394,9 @@ export function closeSurface(surface: string): void {
     if (isSurfaceAvailable(surface)) throw error;
   } finally {
     createdSurfaces.delete(surface);
+    if (automaticSurfaceLayout) {
+      automaticSurfaceLayout = removeSurfaceLeaf(automaticSurfaceLayout, surface);
+    }
   }
 }
 
@@ -268,6 +441,7 @@ export const __pollForExitTest__ = {
   interpretExitSidecar,
   parsePaneId,
   readProcessExitCode,
+  resolveCallerSurface,
 };
 
 export async function pollForExit(
