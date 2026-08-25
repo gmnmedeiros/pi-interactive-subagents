@@ -1,7 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
-import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Type, type Static } from "typebox";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -17,14 +17,15 @@ import { homedir } from "node:os";
 import {
   isMuxAvailable,
   muxSetupHint,
-  createSurface,
+  createReadySurface,
   sendCommand,
   sendLongCommand,
+  waitForStart,
   pollForExit,
   closeSurface,
   shellEscape,
   readScreen,
-} from "./tmux.ts";
+} from "./herdr.ts";
 
 import {
   countSessionEntryLines,
@@ -243,6 +244,30 @@ const SUBAGENT_ALLOWLIST: Set<string> | null = (() => {
   const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
   return list.length > 0 ? new Set(list) : null;
 })();
+
+interface SpawnPermission {
+  isAllowed: boolean;
+  permittedAgents: string[];
+  reason?: "agent not in allowlist" | "agent required" | "unknown agent";
+}
+
+function resolveSpawnPermission(
+  agent: string | undefined,
+  restrictedAgents: Set<string> | null,
+  discoverableAgents: string[],
+): SpawnPermission {
+  const permittedAgents: string[] = restrictedAgents
+    ? [...restrictedAgents]
+    : discoverableAgents;
+
+  if (!agent) return { isAllowed: false, permittedAgents, reason: "agent required" };
+  if (permittedAgents.includes(agent)) return { isAllowed: true, permittedAgents };
+  return {
+    isAllowed: false,
+    permittedAgents,
+    reason: restrictedAgents ? "agent not in allowlist" : "unknown agent",
+  };
+}
 
 function getBundledAgentsDir(): string {
   return join(SUBAGENTS_DIR, "../../agents");
@@ -490,28 +515,15 @@ function widgetIcon(kind: StatusSnapshot["kind"]): string {
   }
 }
 
-/**
- * Wait long enough for a freshly created pane to finish shell startup.
- *
- * Some environments do extra shell-init work before the prompt is ready
- * (for example direnv/devenv), so the delay is configurable for users who hit
- * dropped commands. Keep the historical default at 500ms.
- */
-function getShellReadyDelayMs(): number {
-  const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
-  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
-}
-
 function muxUnavailableResult() {
   return {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require tmux. ${muxSetupHint()}`,
+        text: `Subagents require Herdr. ${muxSetupHint()}`,
       },
     ],
-    details: { error: "tmux not available" },
+    details: { error: "Herdr not available" },
   };
 }
 
@@ -608,6 +620,8 @@ interface RunningSubagent {
   startTime: number;
   sessionFile: string;
   launchScriptFile?: string;
+  startedFile?: string;
+  processExitFile?: string;
   activityFile?: string;
   activity?: SubagentActivityState;
   activityRead?: {
@@ -911,11 +925,8 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
     ? readSubagentActivityFile(activityFile, running.id)
     : { ok: false, reason: "missing" };
 
-  running.activityRead = read.ok
-    ? { ok: true }
-    : { ok: false, reason: read.reason, error: read.error };
-
-  if (read.ok) {
+  if (read.ok === true) {
+    running.activityRead = { ok: true };
     running.activity = read.activity;
     running.statusState = observeStatus(running.statusState, {
       snapshot: "present",
@@ -932,6 +943,7 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
     return;
   }
 
+  running.activityRead = { ok: false, reason: read.reason, error: read.error };
   running.statusState = observeStatus(running.statusState, {
     snapshot: read.reason,
     snapshotError: read.error,
@@ -1008,7 +1020,7 @@ function steerSubagent(
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
+        `Failed to deliver message to subagent "${running.name}" via Herdr: ` +
         `${error?.message ?? String(error)}`,
     };
   }
@@ -1121,7 +1133,6 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 
 export const __test__ = {
   borderLine,
-  getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
@@ -1141,6 +1152,7 @@ export const __test__ = {
   handleSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  resolveSpawnPermission,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1159,6 +1171,38 @@ function startWidgetRefresh() {
   (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;
 }
 
+interface SupervisedLaunch {
+  command: string;
+  processExitFile: string;
+  startedFile: string;
+}
+
+function buildSupervisedLaunch(processCommand: string, launchScriptFile: string): SupervisedLaunch {
+  const startedFile: string = `${launchScriptFile}.started`;
+  const processExitFile: string = `${launchScriptFile}.process-exit`;
+  const command: string = [
+    `printf '%s\\n' 'started' > ${shellEscape(startedFile)}`,
+    processCommand,
+    "process_exit=$?",
+    `printf '%s\\n' "$process_exit" > ${shellEscape(processExitFile)}`,
+    `printf '__SUBAGENT_DONE_%s__\\n' "$process_exit"`,
+    "exit \"$process_exit\"",
+  ].join("\n");
+
+  return { command, processExitFile, startedFile };
+}
+
+async function waitForLaunchStart(surface: string, startedFile: string): Promise<void> {
+  try {
+    await waitForStart(startedFile);
+  } catch (error) {
+    try {
+      closeSurface(surface);
+    } catch {}
+    throw error;
+  }
+}
+
 /**
  * Launch a subagent: creates the multiplexer pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
@@ -1166,12 +1210,15 @@ function startWidgetRefresh() {
  * Call watchSubagent() on the returned object to observe completion.
  */
 async function launchSubagent(
-  params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  params: Static<typeof SubagentParams>,
+  ctx: { sessionManager: { getSessionFile(): string | null | undefined; getSessionId(): string; getSessionDir(): string }; cwd: string },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
+  const name = params.name?.trim();
+
+  if (!name) throw new Error("Subagent name is required before launch");
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const effectiveModel = params.model ?? agentDefs?.model;
@@ -1201,13 +1248,7 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
-  const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
+  const surface = options?.surface ?? await createReadySurface(name);
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
@@ -1271,34 +1312,37 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
-
-    const launchScriptName = `${(params.name || "subagent")
+    const processCommand = `${cdPrefix}${cmdParts.join(" ")}`;
+    const launchScriptName = `${name
       .toLowerCase()
       .replace(/[^a-z0-9\s-]/g, "")
       .replace(/\s+/g, "-")
       .replace(/-+/g, "-")
       .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+    const supervisedLaunch = buildSupervisedLaunch(processCommand, launchScriptFile);
 
-    sendLongCommand(surface, command, {
+    sendLongCommand(surface, supervisedLaunch.command, {
       scriptPath: launchScriptFile,
       scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
+        `# Claude Code subagent launch script for ${name}`,
         `# Generated: ${new Date().toISOString()}`,
         `# Surface: ${surface}`,
       ].join("\n"),
     });
+    await waitForLaunchStart(surface, supervisedLaunch.startedFile);
 
     const running: RunningSubagent = {
       id,
-      name: params.name,
+      name,
       task: params.task,
       agent: params.agent,
       surface,
       startTime,
       sessionFile: subagentSessionFile,
       launchScriptFile,
+      startedFile: supervisedLaunch.startedFile,
+      processExitFile: supervisedLaunch.processExitFile,
       cli: "claude",
       sentinelFile,
       interactive: effectiveInteractive,
@@ -1354,7 +1398,7 @@ async function launchSubagent(
 
   // Apply model, identity, and the default-deny tool/extension restriction via
   // the shared helper (same code path resume uses — they can't drift).
-  applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
+  applySandboxToParts(parts, loadout, { artifactDir, name });
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
   const envParts: string[] = [];
@@ -1366,7 +1410,7 @@ async function launchSubagent(
   if (grantSpawning && agentDefs?.subagentAgents) {
     envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
   }
-  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
+  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
@@ -1388,7 +1432,7 @@ async function launchSubagent(
     taskArg = fullTask;
   } else {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const safeName = params.name
+    const safeName = name
       .toLowerCase()
       .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
       .replace(/\s+/g, "-") // spaces to hyphens
@@ -1414,33 +1458,36 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
-  const launchScriptName = `${(params.name || "subagent")
+  const launchScriptName = `${name
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
     .replace(/\s+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, {
+  const supervisedLaunch = buildSupervisedLaunch(piCommand, launchScriptFile);
+  sendLongCommand(surface, supervisedLaunch.command, {
     scriptPath: launchScriptFile,
     scriptPreamble: [
-      `# Subagent launch script for ${params.name}`,
+      `# Subagent launch script for ${name}`,
       `# Generated: ${new Date().toISOString()}`,
       `# Session: ${subagentSessionFile}`,
       `# Surface: ${surface}`,
     ].join("\n"),
   });
+  await waitForLaunchStart(surface, supervisedLaunch.startedFile);
 
   const running: RunningSubagent = {
     id,
-    name: params.name,
+    name,
     task: params.task,
     agent: params.agent,
     surface,
     startTime,
     sessionFile: subagentSessionFile,
     launchScriptFile,
+    startedFile: supervisedLaunch.startedFile,
+    processExitFile: supervisedLaunch.processExitFile,
     activityFile,
     interactive: effectiveInteractive,
     statusState: createStatusState({
@@ -1532,6 +1579,7 @@ async function watchSubagent(
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
+      processExitFile: running.processExitFile,
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
@@ -1723,38 +1771,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // top-level `fork: true` clone, which has no role and inherits the
         // caller's own already-trusted toolset. Without this guard a missing or
         // unknown `agent` silently launches an unrestricted, full-toolset child.
-        const permittedAgents = SUBAGENT_ALLOWLIST
-          ? [...SUBAGENT_ALLOWLIST]
-          : discoverAgentDefinitions().map((a) => a.name);
-        const permittedSet = new Set(permittedAgents);
-        const permittedList = permittedAgents.join(", ") || "(none)";
+        const discoverableAgents = SUBAGENT_ALLOWLIST
+          ? []
+          : discoverAgentDefinitions().map((agent) => agent.name);
+        const spawnPermission = resolveSpawnPermission(
+          params.agent,
+          SUBAGENT_ALLOWLIST,
+          discoverableAgents,
+        );
+        const permittedList = spawnPermission.permittedAgents.join(", ") || "(none)";
 
-        if (!params.agent) {
+        if (!spawnPermission.isAllowed) {
+          const text = spawnPermission.reason === "agent required"
+            ? `You must specify which agent to spawn via the "agent" field. Available agents: ${permittedList}.`
+            : `You may not spawn the "${params.agent}" agent — it is not ${SUBAGENT_ALLOWLIST ? "in your allowlist" : "a known agent"}. Available agents: ${permittedList}.`;
           return {
-            content: [
-              {
-                type: "text",
-                text:
-                  `You must specify which agent to spawn via the "agent" field. ` +
-                  `Available agents: ${permittedList}.`,
-              },
-            ],
-            details: { error: "agent required" },
-          };
-        } else if (!permittedSet.has(params.agent)) {
-          return {
-            content: [
-              {
-                type: "text",
-                text:
-                  `You may not spawn the "${params.agent}" agent — it is not ` +
-                  `${SUBAGENT_ALLOWLIST ? "in your allowlist" : "a known agent"}. ` +
-                  `Available agents: ${permittedList}.`,
-              },
-            ],
-            details: {
-              error: SUBAGENT_ALLOWLIST ? "agent not in allowlist" : "unknown agent",
-            },
+            content: [{ type: "text", text }],
+            details: { error: spawnPermission.reason },
           };
         }
 
@@ -1944,7 +1977,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback (shouldn't happen)
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const firstContent = result.content[0];
+        const text = firstContent?.type === "text" ? firstContent.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
     });
@@ -2067,7 +2101,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback / error
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const firstContent = result.content[0];
+        const text = firstContent?.type === "text" ? firstContent.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
@@ -2149,8 +2184,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
-        const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        const surface = await createReadySurface(name);
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(sessionPath)];
@@ -2212,7 +2246,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const processCommand = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2223,7 +2257,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        sendLongCommand(surface, command, {
+        const supervisedLaunch = buildSupervisedLaunch(processCommand, launchScriptFile);
+        sendLongCommand(surface, supervisedLaunch.command, {
           scriptPath: launchScriptFile,
           scriptPreamble: [
             `# Subagent resume script for ${name}`,
@@ -2233,6 +2268,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
           ].join("\n"),
         });
+        await waitForLaunchStart(surface, supervisedLaunch.startedFile);
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
@@ -2243,6 +2279,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           startTime,
           sessionFile: sessionPath,
           launchScriptFile,
+          startedFile: supervisedLaunch.startedFile,
+          processExitFile: supervisedLaunch.processExitFile,
           activityFile,
           interactive,
           statusState: createStatusState({
@@ -2355,6 +2393,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!details) return undefined;
 
     return {
+      invalidate(): void {},
       render(width: number): string[] {
         const name = details.name ?? "subagent";
         const exitCode = details.exitCode ?? 0;
@@ -2468,6 +2507,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (lines.length === 0 && overflow === 0) return undefined;
 
     return {
+      invalidate(): void {},
       render(width: number): string[] {
         const lineWidth = Math.max(0, width - 6);
         const contentLines = [
@@ -2495,6 +2535,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!details) return undefined;
 
     return {
+      invalidate(): void {},
       render(width: number): string[] {
         const name = details.name ?? "subagent";
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
