@@ -35,6 +35,26 @@ function readPositiveInteger(name: string, fallback: number): number {
   return Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }
 
+interface SurfaceLeaf {
+  kind: "leaf";
+  surface: string;
+}
+
+interface SurfaceSplit {
+  first: SurfaceLayout;
+  kind: "split";
+  second: SurfaceLayout;
+}
+
+type SurfaceLayout = SurfaceLeaf | SurfaceSplit;
+
+interface SurfaceDepth {
+  depth: number;
+  surface: string;
+}
+
+let automaticSurfaceLayout: SurfaceLayout | null = null;
+
 export interface PollResult {
   reason: "done" | "error" | "process-exit" | "sentinel";
   exitCode: number;
@@ -124,8 +144,88 @@ export function shellEscape(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function listSurfaceDepths(
+  layout: SurfaceLayout,
+  depth: number,
+  surfaces: SurfaceDepth[],
+): void {
+  if (layout.kind === "leaf") {
+    surfaces.push({ depth, surface: layout.surface });
+    return;
+  }
+  listSurfaceDepths(layout.first, depth + 1, surfaces);
+  listSurfaceDepths(layout.second, depth + 1, surfaces);
+}
+
+function replaceSurfaceLeaf(
+  layout: SurfaceLayout,
+  surface: string,
+  replacement: SurfaceLayout,
+): SurfaceLayout {
+  if (layout.kind === "leaf") return layout.surface === surface ? replacement : layout;
+  return {
+    kind: "split",
+    first: replaceSurfaceLeaf(layout.first, surface, replacement),
+    second: replaceSurfaceLeaf(layout.second, surface, replacement),
+  };
+}
+
+function removeSurfaceLeaf(layout: SurfaceLayout, surface: string): SurfaceLayout | null {
+  let first: SurfaceLayout | null;
+  let second: SurfaceLayout | null;
+
+  if (layout.kind === "leaf") return layout.surface === surface ? null : layout;
+  first = removeSurfaceLeaf(layout.first, surface);
+  second = removeSurfaceLeaf(layout.second, surface);
+  if (!first) return second;
+  if (!second) return first;
+  return { kind: "split", first, second };
+}
+
+function pruneUnavailableSurfaces(): void {
+  let surfaces: SurfaceDepth[];
+
+  if (!automaticSurfaceLayout) return;
+  surfaces = [];
+  listSurfaceDepths(automaticSurfaceLayout, 0, surfaces);
+  for (const candidate of surfaces) {
+    if (!isSurfaceAvailable(candidate.surface)) {
+      automaticSurfaceLayout = removeSurfaceLeaf(automaticSurfaceLayout, candidate.surface);
+      createdSurfaces.delete(candidate.surface);
+      if (!automaticSurfaceLayout) return;
+    }
+  }
+}
+
 export function createSurface(name: string): string {
-  return createSurfaceSplit(name, "right");
+  const surfaces: SurfaceDepth[] = [];
+  let direction: "right" | "down";
+  let newSurface: string;
+  let target: SurfaceDepth;
+
+  pruneUnavailableSurfaces();
+  if (!automaticSurfaceLayout) {
+    direction = process.env.PI_SUBAGENT_ID ? "down" : "right";
+    newSurface = createSurfaceSplit(name, direction);
+    automaticSurfaceLayout = { kind: "leaf", surface: newSurface };
+    return newSurface;
+  }
+
+  listSurfaceDepths(automaticSurfaceLayout, 0, surfaces);
+  target = surfaces.reduce((best, candidate) =>
+    candidate.depth < best.depth ? candidate : best,
+  );
+  newSurface = createSurfaceSplit(name, "down", target.surface);
+  automaticSurfaceLayout = replaceSurfaceLeaf(
+    automaticSurfaceLayout,
+    target.surface,
+    {
+      kind: "split",
+      first: { kind: "leaf", surface: target.surface },
+      second: { kind: "leaf", surface: newSurface },
+    },
+  );
+  return newSurface;
 }
 
 export function createSurfaceSplit(
@@ -282,6 +382,9 @@ export function closeSurface(surface: string): void {
   }
   if (!isSurfaceAvailable(surface)) {
     createdSurfaces.delete(surface);
+    if (automaticSurfaceLayout) {
+      automaticSurfaceLayout = removeSurfaceLeaf(automaticSurfaceLayout, surface);
+    }
     return;
   }
 
@@ -291,6 +394,9 @@ export function closeSurface(surface: string): void {
     if (isSurfaceAvailable(surface)) throw error;
   } finally {
     createdSurfaces.delete(surface);
+    if (automaticSurfaceLayout) {
+      automaticSurfaceLayout = removeSurfaceLeaf(automaticSurfaceLayout, surface);
+    }
   }
 }
 
