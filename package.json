@@ -1,15 +1,30 @@
 {
   "name": "pi-interactive-subagents",
-  "version": "3.7.2",
+  "version": "4.0.0",
   "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in Herdr",
   "keywords": [
     "pi-package"
   ],
+  "files": [
+    "agents",
+    "CHANGELOG.md",
+    "config.json.example",
+    "LICENSE",
+    "pi-extension",
+    "README.md"
+  ],
   "license": "MIT",
   "author": "Amos Blomqvist",
+  "contributors": [
+    "Gabriel Medeiros"
+  ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/amosblomqvist/pi-interactive-subagents"
+    "url": "https://github.com/gmnmedeiros/pi-interactive-subagents"
+  },
+  "homepage": "https://github.com/gmnmedeiros/pi-interactive-subagents#readme",
+  "bugs": {
+    "url": "https://github.com/gmnmedeiros/pi-interactive-subagents/issues"
   },
   "type": "module",
   "scripts": {
