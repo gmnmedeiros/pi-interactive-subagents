@@ -9,7 +9,7 @@ Spawn a restricted agent, continue working in the parent session, interact with 
 Install the immutable Git release:
 
 ```bash
-pi install git:github.com/gmnmedeiros/pi-interactive-subagents@v4.0.1
+pi install git:github.com/gmnmedeiros/pi-interactive-subagents@v5.0.0
 ```
 
 Start Pi inside a Herdr-managed pane. The extension detects Herdr automatically after Pi loads the package.
@@ -62,8 +62,8 @@ The original widget tracks all running children:
 
 ```text
 ╭─ Subagents ──────────────────────────── 2 running ─╮
-│ 00:23  scout      active · bash 7m                 │
-│ 00:45  scout-2    waiting 2m                       │
+│ 00:23  worker      active · edit 7m                │
+│ 00:45  worker-2    waiting 2m                      │
 ╰────────────────────────────────────────────────────╯
 ```
 
@@ -83,7 +83,7 @@ There is also a `/subagent <agent> <task>` command.
 ### Spawning
 
 ```typescript
-subagent({ agent: "scout", task: "Analyze the auth module" });
+subagent({ agent: "worker", task: "Update the auth configuration" });
 subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode toggle" });
 ```
 
@@ -100,7 +100,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 Address agents by their unique names:
 
 ```typescript
-subagent_message({ name: "scout", message: "Also check the auth middleware" });
+subagent_message({ name: "worker", message: "Also update the auth middleware" });
 ```
 
 - **Running agent:** the message is typed into its pane and becomes steering input.
@@ -118,15 +118,15 @@ subagent_message({ name: "worker", message: "Use the existing schema." });
 
 Parallel questions are supported because every child has a unique name and sidecar file.
 
-## Bundled agents
+## Bundled agent
 
-| Agent | Model | Tools | Role |
-| --- | --- | --- | --- |
-| **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Read-only codebase reconnaissance |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Sourced web research |
-| **worker** | `openrouter/z-ai/glm-5.3` | file and shell tools, web tools, child spawning | General implementation; may spawn `scout` and `researcher` |
+The package intentionally provides one canonical agent type:
 
-All bundled agents use `auto-exit: true`.
+| Agent | Model | Thinking | Tools | Child agents |
+| --- | --- | --- | --- | --- |
+| **worker** | `openai-codex/gpt-5.6-sol` | `medium` | `read`, `write`, `edit` | none |
+
+The worker uses `auto-exit: true`. It cannot run shell commands or spawn subagents. Its final message states that command-based tests were not run.
 
 ## Custom agents
 
@@ -179,7 +179,7 @@ Set `tools` to enable the default-deny sandbox. Pi starts with extension discove
 ---
 name: restricted-worker
 tools: read, write, edit, bash
-subagent_agents: scout, researcher
+subagent_agents: code-scout
 ---
 ```
 

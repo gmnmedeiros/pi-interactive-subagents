@@ -1,5 +1,15 @@
 # Changelog
 
+## 5.0.0 — 2026-08-25
+
+### Changed
+
+- Canonized `worker` as the only bundled agent type.
+- Set the worker model to `openai-codex/gpt-5.6-sol` with medium thinking.
+- Restricted the worker to `read`, `write`, and `edit`.
+- Removed bundled worker child-spawning permission.
+- Removed the bundled `scout` and `researcher` definitions.
+
 ## 4.0.1 — 2026-08-25
 
 ### Fixed
