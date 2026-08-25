@@ -30,7 +30,7 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import { shellEscape } from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -56,7 +56,7 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
+import { __pollForExitTest__ } from "../pi-extension/subagents/herdr.ts";
 
 // --- Helpers ---
 
@@ -1203,7 +1203,52 @@ describe("subagent discovery", () => {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
       assert.equal(defs.subagentAgents, undefined, `${name} should not declare subagent_agents`);
+
+      const allowlist = testApi.buildSubagentToolAllowlist(defs.tools, { grantSpawning: false });
+      const tools = new Set(allowlist?.split(",") ?? []);
+      for (const spawningTool of ["subagent", "subagent_message", "subagents_list"]) {
+        assert.equal(tools.has(spawningTool), false, `${name} must not receive ${spawningTool}`);
+      }
     }
+  });
+
+  it("permits restricted children to spawn only named agent types", () => {
+    const restrictedAgents = new Set(["scout", "researcher"]);
+    const discoverableAgents = ["scout", "researcher", "worker"];
+
+    assert.deepEqual(
+      testApi.resolveSpawnPermission("scout", restrictedAgents, discoverableAgents),
+      { isAllowed: true, permittedAgents: ["scout", "researcher"] },
+    );
+    assert.deepEqual(
+      testApi.resolveSpawnPermission("worker", restrictedAgents, discoverableAgents),
+      {
+        isAllowed: false,
+        permittedAgents: ["scout", "researcher"],
+        reason: "agent not in allowlist",
+      },
+    );
+  });
+
+  it("rejects unknown top-level agents and missing agent names", () => {
+    const discoverableAgents = ["scout", "researcher", "worker"];
+
+    assert.deepEqual(
+      testApi.resolveSpawnPermission("unknown", null, discoverableAgents),
+      {
+        isAllowed: false,
+        permittedAgents: discoverableAgents,
+        reason: "unknown agent",
+      },
+    );
+    assert.deepEqual(
+      testApi.resolveSpawnPermission(undefined, null, discoverableAgents),
+      {
+        isAllowed: false,
+        permittedAgents: discoverableAgents,
+        reason: "agent required",
+      },
+    );
   });
 
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
@@ -1757,8 +1802,8 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("tmux.ts interpretExitSidecar", () => {
-  const { interpretExitSidecar } = __pollForExitTest__;
+describe("herdr.ts exit signals", () => {
+  const { interpretExitSidecar, readProcessExitCode } = __pollForExitTest__;
 
   it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
     // ask_question writes a `.ask` signal, not a `.exit` ping sidecar, so an
@@ -1801,6 +1846,22 @@ describe("tmux.ts interpretExitSidecar", () => {
   it("treats unknown payload shapes as done", () => {
     assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
     assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+  });
+
+  it("reads non-zero process exit codes and ignores incomplete files", () => {
+    const dir = createTestDir();
+    const processExitFile = join(dir, "process-exit");
+
+    try {
+      writeFileSync(processExitFile, "7\n");
+      assert.equal(readProcessExitCode(processExitFile), 7);
+      writeFileSync(processExitFile, "");
+      assert.equal(readProcessExitCode(processExitFile), null);
+      writeFileSync(processExitFile, "invalid");
+      assert.equal(readProcessExitCode(processExitFile), null);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 describe("commands", () => {
@@ -2475,37 +2536,6 @@ describe("subagent status renderer", () => {
   });
 });
 
-describe("subagent startup delay", () => {
-  it("defaults to 500ms when no env var is set", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    try {
-      assert.equal(testApi.getShellReadyDelayMs(), 500);
-    } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
-    }
-  });
-
-  it("uses PI_SUBAGENT_SHELL_READY_DELAY_MS when it is set", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
-    try {
-      assert.equal(testApi.getShellReadyDelayMs(), 2500);
-    } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
-    }
-  });
-});
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;
@@ -2668,7 +2698,7 @@ describe("subagent display helpers", () => {
   });
 });
 
-describe("tmux.ts", () => {
+describe("herdr.ts", () => {
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");

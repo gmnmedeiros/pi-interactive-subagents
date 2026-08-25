@@ -2,14 +2,13 @@
  * Integration tests for the full subagent lifecycle.
  *
  * These tests spawn REAL pi sessions with REAL LLM calls (haiku by default).
- * Each test creates a tmux pane, runs pi with a task that uses the subagent
+ * Each test creates a Herdr pane, runs pi with a task that uses the subagent
  * tool, and verifies the outcome via marker files and screen output.
  *
  * Costs: ~$0.01-0.05 per test run (haiku).
  * Duration: ~30-90s per test.
  *
- * Run inside tmux:
- *   tmux new 'npm run test:integration'
+ * Set PI_RUN_LLM_INTEGRATION=1 to enable these tests inside Herdr.
  *
  * Configuration:
  *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
@@ -23,6 +22,7 @@ import {
   createTestEnv,
   cleanupTestEnv,
   createTrackedSurface,
+  createTrackedSurfaceSplit,
   startPi,
   waitForScreen,
   waitForFile,
@@ -31,14 +31,15 @@ import {
   trackTempFile,
   readScreen,
   PI_TIMEOUT,
+  TEST_MODEL,
   type TestEnv,
 } from "./harness.ts";
 
-const backends = getAvailableBackends();
+const shouldRunLlmIntegration: boolean = process.env.PI_RUN_LLM_INTEGRATION === "1";
+const backends: string[] = shouldRunLlmIntegration ? getAvailableBackends() : [];
 
 if (backends.length === 0) {
-  console.log("⚠️  tmux is not available — skipping subagent lifecycle integration tests");
-  console.log("   Run inside tmux to enable these tests.");
+  console.log("LLM integration tests are disabled — set PI_RUN_LLM_INTEGRATION=1 inside Herdr");
 }
 
 for (const backend of backends) {
@@ -60,19 +61,22 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-echo-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `echo-${id}`);
-      await sleep(1000);
+      const surface = createTrackedSurfaceSplit(env, `echo-${id}`, "down");
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Echo-${id}"`,
         `  agent: "test-echo"`,
-        `  task: "Run this bash command: echo 'PASS_${id}' > '${markerFile}'"`,
+        `  model: "${TEST_MODEL}"`,
+        `  task: "Run this bash command: sleep 5; echo 'PASS_${id}' > '${markerFile}'"`,
         `Do not do anything else. Just call the subagent tool once.`,
         `After you receive the subagent result, say INTEGRATION_COMPLETE.`,
       ].join("\n");
 
       startPi(surface, env.dir, task);
+
+      const widgetScreen = await waitForScreen(surface, /Subagents[\s\S]*Echo-/i, PI_TIMEOUT, 300);
+      assert.match(widgetScreen, /Subagents/i, "Original widget should show the running subagent");
 
       // Verify: subagent created the marker file
       const content = await waitForFile(markerFile, PI_TIMEOUT, /PASS/);

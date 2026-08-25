@@ -2,9 +2,9 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect whether tmux is available
+ * - Detect whether Herdr is available
  * - Create isolated test environments with test agent definitions
- * - Start real pi sessions in tmux panes
+ * - Start real pi sessions in Herdr panes
  * - Poll for file creation and screen output
  * - Clean up panes and temp files after tests
  */
@@ -28,18 +28,22 @@ import {
   createSurfaceSplit,
   sendCommand,
   sendLongCommand,
+  waitForStart,
+  pollForExit,
   readScreen,
   readScreenAsync,
   closeSurface,
   shellEscape,
-} from "../../pi-extension/subagents/tmux.ts";
+} from "../../pi-extension/subagents/herdr.ts";
 
-// Re-export tmux primitives for tests
+// Re-export Herdr primitives for tests
 export {
   createSurface,
   createSurfaceSplit,
   sendCommand,
   sendLongCommand,
+  waitForStart,
+  pollForExit,
   readScreen,
   readScreenAsync,
   closeSurface,
@@ -75,25 +79,26 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 
 // ── Backend detection ──
 
-/**
- * Detect whether tmux is available in the current environment.
- * Returns ["tmux"] or [].
- */
-export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["tmux"] : [];
+interface HerdrPaneListResponse {
+  result?: {
+    panes?: Array<{ focused?: boolean; pane_id?: string }>;
+  };
 }
 
-export function focusSurface(surface: string): void {
-  execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
+export function getAvailableBackends(): string[] {
+  return isMuxAvailable() ? ["herdr"] : [];
 }
 
 export function getFocusedSurface(): string | null {
+  let response: HerdrPaneListResponse;
+  let output: string;
+
   try {
-    const panes = execFileSync("tmux", ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
+    output = execFileSync(process.env.HERDR_BIN_PATH ?? "herdr", ["pane", "list"], {
       encoding: "utf8",
     });
-    const activeLine = panes.split("\n").find((line) => line.endsWith(" 1"));
-    return activeLine?.split(" ")[0] ?? null;
+    response = JSON.parse(output) as HerdrPaneListResponse;
+    return response.result?.panes?.find((pane) => pane.focused)?.pane_id ?? null;
   } catch {
     return null;
   }
@@ -110,7 +115,7 @@ export async function waitForFocusedSurface(
   }
 
   throw new Error(
-    `Timeout (${timeout}ms) waiting for focused tmux pane ${surface}; ` +
+    `Timeout (${timeout}ms) waiting for focused Herdr pane ${surface}; ` +
       `current focus is ${getFocusedSurface() ?? "unknown"}`,
   );
 }
@@ -120,7 +125,7 @@ export async function waitForFocusedSurface(
 export interface TestEnv {
   /** Temp directory serving as the test project root */
   dir: string;
-  /** Panes created during the test (cleaned up automatically) */
+  /** Panes created during the test and cleaned up automatically */
   surfaces: string[];
   /** Temp files to clean up */
   tempFiles: string[];
@@ -196,7 +201,7 @@ export function untrackSurface(env: TestEnv, surface: string): void {
 // ── Pi session management ──
 
 /**
- * Start a pi session in a mux surface with the subagents extension loaded.
+ * Start a pi session in a Herdr pane with the subagents extension loaded.
  * Returns immediately — the pi process runs asynchronously in the surface.
  *
  * The command ends with a sentinel so we can detect when pi exits:
