@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.0.1 — 2026-08-25
+
+### Fixed
+
+- Wait until the pane shell owns the foreground process group before sending the readiness bootstrap. This supports shells that run slow initialization commands such as `pyenv rehash`.
+
 ## 4.0.0 — 2026-08-25
 
 ### Changed

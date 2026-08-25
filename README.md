@@ -9,7 +9,7 @@ Spawn a restricted agent, continue working in the parent session, interact with 
 Install the immutable Git release:
 
 ```bash
-pi install git:github.com/gmnmedeiros/pi-interactive-subagents@v4.0.0
+pi install git:github.com/gmnmedeiros/pi-interactive-subagents@v4.0.1
 ```
 
 Start Pi inside a Herdr-managed pane. The extension detects Herdr automatically after Pi loads the package.
@@ -230,7 +230,7 @@ Optional environment variables:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `HERDR_BIN_PATH` | `herdr` | Override the Herdr executable |
-| `PI_SUBAGENT_SURFACE_READY_TIMEOUT_MS` | `3000` | Maximum wait for one shell bootstrap attempt |
+| `PI_SUBAGENT_SURFACE_READY_TIMEOUT_MS` | `10000` | Maximum wait for the shell and bootstrap in one attempt |
 | `PI_SUBAGENT_SURFACE_READY_ATTEMPTS` | `2` | Maximum shell bootstrap attempts |
 
 ## Development and testing

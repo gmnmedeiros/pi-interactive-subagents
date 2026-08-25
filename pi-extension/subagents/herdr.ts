@@ -10,7 +10,7 @@ const DEFAULT_START_TIMEOUT_MS = 10_000;
 const DEFAULT_START_INTERVAL_MS = 50;
 const DEFAULT_SURFACE_READY_TIMEOUT_MS = readPositiveInteger(
   "PI_SUBAGENT_SURFACE_READY_TIMEOUT_MS",
-  3_000,
+  10_000,
 );
 const MAX_SURFACE_READY_ATTEMPTS = readPositiveInteger(
   "PI_SUBAGENT_SURFACE_READY_ATTEMPTS",
@@ -24,6 +24,15 @@ interface HerdrPaneResponse {
   result?: {
     pane?: {
       pane_id?: string;
+    };
+  };
+}
+
+interface HerdrProcessInfoResponse {
+  result?: {
+    process_info?: {
+      foreground_process_group_id?: number;
+      shell_pid?: number;
     };
   };
 }
@@ -138,6 +147,39 @@ function isSurfaceAvailable(surface: string): boolean {
   } catch {
     return false;
   }
+}
+
+function isShellForeground(surface: string): boolean {
+  let response: HerdrProcessInfoResponse;
+  let output: string;
+
+  try {
+    output = runHerdr(["pane", "process-info", "--pane", surface]);
+    response = JSON.parse(output) as HerdrProcessInfoResponse;
+  } catch {
+    return false;
+  }
+  return (
+    typeof response.result?.process_info?.shell_pid === "number" &&
+    response.result.process_info.foreground_process_group_id ===
+      response.result.process_info.shell_pid
+  );
+}
+
+async function waitForShellForeground(surface: string, timeout: number): Promise<void> {
+  const startedAt: number = Date.now();
+
+  while (Date.now() - startedAt < timeout) {
+    if (!isSurfaceAvailable(surface)) {
+      throw new Error(`Herdr pane ${surface} closed before its shell became ready`);
+    }
+    if (isShellForeground(surface)) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
+      if (isShellForeground(surface)) return;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, DEFAULT_START_INTERVAL_MS));
+  }
+  throw new Error(`Herdr pane ${surface} shell was not ready within ${timeout}ms`);
 }
 
 export function shellEscape(value: string): string {
@@ -283,6 +325,7 @@ export async function createReadySurface(name: string): Promise<string> {
     const readyFile: string = join(readyDir, `${token}.ready`);
 
     try {
+      await waitForShellForeground(surface, DEFAULT_SURFACE_READY_TIMEOUT_MS);
       sendCommand(surface, `printf '%s\\n' ${shellEscape(token)} > ${shellEscape(readyFile)}`);
       await waitForStart(readyFile, { timeout: DEFAULT_SURFACE_READY_TIMEOUT_MS });
       if (readFileSync(readyFile, "utf8").trim() !== token) {
