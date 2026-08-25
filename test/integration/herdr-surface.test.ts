@@ -26,11 +26,13 @@ import {
   type TestEnv,
 } from "./harness.ts";
 
-const backends: string[] = getAvailableBackends();
+const backends: string[] = process.env.PI_RUN_HERDR_INTEGRATION === "1"
+  ? getAvailableBackends()
+  : [];
 const HERDR_BIN: string = process.env.HERDR_BIN_PATH ?? "herdr";
 
 if (backends.length === 0) {
-  console.log("Herdr is not available — skipping Herdr surface integration tests");
+  console.log("Herdr surface tests are disabled — set PI_RUN_HERDR_INTEGRATION=1 inside Herdr");
 }
 
 for (const backend of backends) {

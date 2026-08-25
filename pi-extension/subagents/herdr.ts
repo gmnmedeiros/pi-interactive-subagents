@@ -8,7 +8,16 @@ const execFileAsync = promisify(execFile);
 const HERDR_BIN = process.env.HERDR_BIN_PATH?.trim() || "herdr";
 const DEFAULT_START_TIMEOUT_MS = 10_000;
 const DEFAULT_START_INTERVAL_MS = 50;
+const DEFAULT_SURFACE_READY_TIMEOUT_MS = readPositiveInteger(
+  "PI_SUBAGENT_SURFACE_READY_TIMEOUT_MS",
+  3_000,
+);
+const MAX_SURFACE_READY_ATTEMPTS = readPositiveInteger(
+  "PI_SUBAGENT_SURFACE_READY_ATTEMPTS",
+  2,
+);
 const createdSurfaces = new Set<string>();
+let callerSurface: string | null = null;
 let isHerdrCommandAvailable: boolean | null = null;
 
 interface HerdrPaneResponse {
@@ -17,6 +26,13 @@ interface HerdrPaneResponse {
       pane_id?: string;
     };
   };
+}
+
+function readPositiveInteger(name: string, fallback: number): number {
+  const rawValue: string | undefined = process.env[name]?.trim();
+  const value: number = rawValue ? Number(rawValue) : Number.NaN;
+
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }
 
 export interface PollResult {
@@ -58,19 +74,41 @@ function runHerdr(args: string[]): string {
   return execFileSync(HERDR_BIN, args, { encoding: "utf8" });
 }
 
-function parsePaneId(output: string): string {
+function parsePaneId(output: string, operation: string): string {
   let response: HerdrPaneResponse;
   let paneId: string | undefined;
 
   try {
     response = JSON.parse(output) as HerdrPaneResponse;
   } catch {
-    throw new Error(`Herdr returned malformed JSON while creating a pane: ${output}`);
+    throw new Error(`Herdr returned malformed JSON while ${operation}: ${output}`);
   }
 
   paneId = response.result?.pane?.pane_id;
-  if (!paneId) throw new Error(`Herdr returned no pane ID: ${output}`);
+  if (!paneId) throw new Error(`Herdr returned no pane ID while ${operation}: ${output}`);
   return paneId;
+}
+
+function resolveCallerSurface(): string {
+  const inheritedSurface: string | undefined = process.env.HERDR_PANE_ID?.trim();
+  let output: string;
+
+  if (callerSurface) return callerSurface;
+  if (inheritedSurface) {
+    callerSurface = inheritedSurface;
+    return callerSurface;
+  }
+
+  try {
+    output = runHerdr(["pane", "current", "--current"]);
+  } catch (error) {
+    throw new Error(
+      "Failed to resolve the current Herdr caller pane. Start pi inside a Herdr pane.",
+      { cause: error },
+    );
+  }
+  callerSurface = parsePaneId(output, "resolving the current caller");
+  return callerSurface;
 }
 
 function isSurfaceAvailable(surface: string): boolean {
@@ -105,11 +143,7 @@ export function createSurfaceSplit(
     throw new Error(`Herdr only supports right and down pane splits, not ${direction}`);
   }
 
-  if (fromSurface) {
-    args.push("--pane", fromSurface);
-  } else {
-    args.push("--current");
-  }
+  args.push("--pane", fromSurface ?? resolveCallerSurface());
   args.push(
     "--direction",
     direction,
@@ -129,13 +163,46 @@ export function createSurfaceSplit(
     );
   }
 
-  paneId = parsePaneId(output);
+  paneId = parsePaneId(output, "creating a pane");
   createdSurfaces.add(paneId);
   return paneId;
 }
 
 export function sendCommand(surface: string, command: string): void {
   runHerdr(["pane", "run", surface, command]);
+}
+
+export async function createReadySurface(name: string): Promise<string> {
+  const readyDir: string = join(tmpdir(), "pi-subagent-surface-ready");
+  let lastError: unknown = null;
+
+  mkdirSync(readyDir, { recursive: true });
+  for (let attempt = 1; attempt <= MAX_SURFACE_READY_ATTEMPTS; attempt += 1) {
+    const surface: string = createSurface(name);
+    const token: string = `${process.pid}-${Date.now()}-${attempt}-${Math.random().toString(16).slice(2)}`;
+    const readyFile: string = join(readyDir, `${token}.ready`);
+
+    try {
+      sendCommand(surface, `printf '%s\\n' ${shellEscape(token)} > ${shellEscape(readyFile)}`);
+      await waitForStart(readyFile, { timeout: DEFAULT_SURFACE_READY_TIMEOUT_MS });
+      if (readFileSync(readyFile, "utf8").trim() !== token) {
+        throw new Error(`Herdr pane ${surface} wrote an invalid shell-readiness token`);
+      }
+      rmSync(readyFile, { force: true });
+      return surface;
+    } catch (error) {
+      lastError = error;
+      try {
+        closeSurface(surface);
+      } catch {}
+      rmSync(readyFile, { force: true });
+    }
+  }
+
+  throw new Error(
+    `Herdr did not provide a command-ready shell after ${MAX_SURFACE_READY_ATTEMPTS} attempts`,
+    { cause: lastError },
+  );
 }
 
 export function sendLongCommand(
@@ -268,6 +335,7 @@ export const __pollForExitTest__ = {
   interpretExitSidecar,
   parsePaneId,
   readProcessExitCode,
+  resolveCallerSurface,
 };
 
 export async function pollForExit(

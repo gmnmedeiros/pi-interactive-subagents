@@ -13,7 +13,8 @@
   },
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts",
+    "test": "node --test test/test.ts test/herdr-reliability.test.ts",
+    "test:cleanup-herdr": "node test/integration/cleanup-herdr-test-panes.ts",
     "test:herdr-raw": "node --test test/integration/herdr-raw-surface.test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts",
     "typecheck": "tsc"

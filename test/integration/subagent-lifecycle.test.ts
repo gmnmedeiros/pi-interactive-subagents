@@ -8,7 +8,7 @@
  * Costs: ~$0.01-0.05 per test run (haiku).
  * Duration: ~30-90s per test.
  *
- * Set PI_RUN_LLM_INTEGRATION=1 to enable these tests inside Herdr.
+ * Set PI_RUN_HERDR_INTEGRATION=1 and PI_RUN_LLM_INTEGRATION=1 to enable these tests inside Herdr.
  *
  * Configuration:
  *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
@@ -35,11 +35,15 @@ import {
   type TestEnv,
 } from "./harness.ts";
 
-const shouldRunLlmIntegration: boolean = process.env.PI_RUN_LLM_INTEGRATION === "1";
+const shouldRunLlmIntegration: boolean =
+  process.env.PI_RUN_HERDR_INTEGRATION === "1" &&
+  process.env.PI_RUN_LLM_INTEGRATION === "1";
 const backends: string[] = shouldRunLlmIntegration ? getAvailableBackends() : [];
 
 if (backends.length === 0) {
-  console.log("LLM integration tests are disabled — set PI_RUN_LLM_INTEGRATION=1 inside Herdr");
+  console.log(
+    "LLM integration tests are disabled — set PI_RUN_HERDR_INTEGRATION=1 and PI_RUN_LLM_INTEGRATION=1 inside Herdr",
+  );
 }
 
 for (const backend of backends) {
