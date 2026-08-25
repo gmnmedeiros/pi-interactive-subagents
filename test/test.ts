@@ -1172,43 +1172,32 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/researcher/worker all resolve as non-interactive (auto-exit)", () => {
-    for (const name of ["scout", "researcher", "worker"]) {
-      const defs = testApi.loadAgentDefaults(name);
-      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(
-        testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        false,
-        `${name} should resolve as non-interactive (autonomous, auto-exit)`,
-      );
-    }
+  it("bundles only the worker agent", () => {
+    const bundledAgents = testApi.discoverAgentDefinitions()
+      .filter((agent: any) => agent.source === "package")
+      .map((agent: any) => agent.name);
+
+    assert.deepEqual(bundledAgents, ["worker"]);
   });
 
-  it("worker is granted the spawning toolset restricted to scout and researcher", () => {
+  it("bundled worker uses gpt-5.6-sol with only file tools and no spawning", () => {
     const worker = testApi.loadAgentDefaults("worker");
     assert.ok(worker, "expected bundled worker to be discoverable");
-    assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
+    assert.equal(worker.model, "openai-codex/gpt-5.6-sol");
+    assert.equal(worker.thinking, "medium");
+    assert.equal(worker.tools, "read, write, edit");
+    assert.equal(worker.subagentAgents, undefined);
+    assert.equal(worker.autoExit, true);
+    assert.equal(
+      testApi.resolveEffectiveInteractive({ name: "worker", task: "" }, worker),
+      false,
+    );
 
-    const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
-    assert.ok(allowlist, "expected an allowlist");
-    const tools = new Set(allowlist!.split(","));
-    for (const t of ["subagent", "subagent_message", "subagents_list"]) {
-      assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
-    }
-    assert.ok(tools.has("bash"), "expected worker to keep bash");
-  });
-
-  it("scout and researcher are not granted spawning tools", () => {
-    for (const name of ["scout", "researcher"]) {
-      const defs = testApi.loadAgentDefaults(name);
-      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(defs.subagentAgents, undefined, `${name} should not declare subagent_agents`);
-
-      const allowlist = testApi.buildSubagentToolAllowlist(defs.tools, { grantSpawning: false });
-      const tools = new Set(allowlist?.split(",") ?? []);
-      for (const spawningTool of ["subagent", "subagent_message", "subagents_list"]) {
-        assert.equal(tools.has(spawningTool), false, `${name} must not receive ${spawningTool}`);
-      }
+    const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: false });
+    const tools = new Set(allowlist?.split(",") ?? []);
+    assert.deepEqual(tools, new Set(["read", "write", "edit", "ask_question"]));
+    for (const spawningTool of ["subagent", "subagent_message", "subagents_list"]) {
+      assert.equal(tools.has(spawningTool), false, `worker must not receive ${spawningTool}`);
     }
   });
 
@@ -1873,13 +1862,13 @@ describe("commands", () => {
     const subagent = registeredCommands.find((command) => command.name === "subagent");
     assert.ok(subagent, "expected /subagent to be registered");
 
-    subagent.handler("scout map the auth code", {
+    subagent.handler("worker update the auth configuration", {
       ui: { notify() {} },
     });
 
     assert.equal(sentUserMessages.length, 1);
-    assert.match(sentUserMessages[0], /agent: "scout"/);
-    assert.match(sentUserMessages[0], /map the auth code/);
+    assert.match(sentUserMessages[0], /agent: "worker"/);
+    assert.match(sentUserMessages[0], /update the auth configuration/);
   });
 
   it("does not register the removed /iterate or /plan commands", () => {
